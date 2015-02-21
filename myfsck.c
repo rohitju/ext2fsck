@@ -15,35 +15,26 @@ typedef struct {
     uint32_t partition_length;
 } p_metadata;
 
-
-typedef struct {
-    uint32_t bg_block_bitmap;
-    uint32_t bg_inode_bitmap;
-    uint32_t bg_inode_table;
-    uint16_t bg_free_blocks_count;
-    uint16_t bg_free_inodes_count;
-} gd;
-
-typedef struct {
-    uint16_t i_mode;
-    uint32_t i_size;
-    uint16_t i_links_count;
-    uint32_t i_blocks;
-    uint32_t i_flags;
-    uint32_t  i_block[15];
-} inode;
+typedef enum {DIRECTORY_DATA_BLOCK, FILE_DATA_BLOCK} db_type;
 
 void get_partition_details(int part_number, p_metadata *data);
 void read_sectors (int64_t start_sector, unsigned int num_sectors, void *into);
 void read_superblock_info(int part_number, struct ext2_super_block *superblock);
 void read_gd_info(int part_number, struct ext2_group_desc *gd_info);
 unsigned char get_partition_type (unsigned char *sector, int part_num);
-void read_inode_info(uint32_t i_block_start, uint32_t inode_num, struct ext2_inode *i_info
-        ,struct ext2_group_desc *gd_info, struct ext2_super_block *superblock, uint32_t partition_number);
+void read_inode_info(uint32_t inode_num, struct ext2_inode *i_info);
 bool inode_allocated(uint32_t inode_num, struct ext2_group_desc *gd_info, uint32_t partition_number);
+void read_data_block(uint32_t block_num, db_type type);
+void read_group_descriptor_table();
+void traverse_directories(int inode_num);
+void indirect_traversal(int curr_level, int max_indirection, int block_num, db_type type);
+struct ext2_dir_entry_2* read_directory_block(int block_num, int *count);
 
 int block_size;
 int sectors_per_block;
+uint32_t partition_start;
+struct ext2_super_block super;
+char *group_descriptor_table;
 
 int main (int argc, char **argv){
     int part_number;
@@ -84,6 +75,7 @@ int main (int argc, char **argv){
     } 
     p_metadata part_detail;
     get_partition_details(part_number, &part_detail);
+    partition_start = part_detail.partition_start;
     if (part_detail.part_type != 0xFF) {
         printf("0x%02X %d %d\n", part_detail.part_type, part_detail.partition_start, 
                 part_detail.partition_length);
@@ -91,29 +83,228 @@ int main (int argc, char **argv){
     else 
         printf("-1\n");
 
-    struct ext2_super_block super;
     read_superblock_info(part_number, &super);
-    printf("Magic number is 0x%02x\n", super.s_magic);
+    //printf("Magic number is 0x%02x\n", super.s_magic);
     block_size = 1024 << super.s_log_block_size;
     sectors_per_block = block_size / sector_size_bytes;
+    group_descriptor_table = (char*)malloc(sectors_per_block * sector_size_bytes);
+    read_group_descriptor_table();
 
-    struct ext2_group_desc gd_info;
-    read_gd_info(part_number, &gd_info);
-    uint32_t inode_table_start = gd_info.bg_inode_table;
 
-    struct ext2_inode i_info;
+   /* struct ext2_inode i_info;
     read_inode_info(inode_table_start, 2, &i_info, 
             &gd_info, &super, part_detail.partition_start);
-    printf("Inode mode is: %d\n", i_info.i_mode);
+    printf("Inode mode is: %d\n", i_info.i_mode);*/
 
-    if (inode_allocated(2, &gd_info, part_detail.partition_start))
+    /*if (inode_allocated(2, &gd_info, part_detail.partition_start))
         printf("Inode %d is allocated!\n", 2);
     else
-        printf("Inode %d is not allocated!\n", 2);
+        printf("Inode %d is not allocated!\n", 2);*/
 
-    //read_directory_entries
+    //Look for lions in /
+    /*int i;
+    for(i = 0; i < 12; i++){
+        if(i_info.i_block[i] == 0)
+            continue;
+        //printf("Data block %d is %d\n", i, i_info.i_block[i]);
+        //read_directory_data_block(i_info.block[i]);
+        read_directory_data_block(i_info.i_block[i]);
+    }*/
+    traverse_directories(2);
 }
 
+void read_group_descriptor_table(){
+    read_sectors(partition_start + (sectors_per_block * 2), sectors_per_block, group_descriptor_table);
+}
+
+void indirect_traversal(int curr_level, int max_indirection, int block_num, db_type type){
+    int offset = 0;
+    unsigned char buf[sector_size_bytes * sectors_per_block];
+    read_sectors(partition_start + (sectors_per_block * block_num), sectors_per_block, buf);
+
+    printf("Current level is %d for max_indirection %d and type is %d\n", curr_level, max_indirection, type);
+
+    if(curr_level == max_indirection){
+        read_data_block(block_num, type);
+    }
+
+
+    else {
+        while (offset < (sectors_per_block * sector_size_bytes)){
+           int curr_block = read_bytes(buf, offset, 4);
+           indirect_traversal(curr_level + 1, max_indirection, curr_block, type);
+           offset  = offset + 4;
+        }
+    }
+
+}
+
+void traverse_directories(int inode_num){
+    /*int block_group = (inode_num - 1) / super.s_inodes_per_group;
+    //printf("Block group is %d\n", block_group);
+    struct ext2_group_desc gd_info;
+    read_gd_info(block_group, &gd_info);
+    //printf("Inode start block is %d\n", gd_info.bg_inode_table);
+    uint32_t inode_table_start = gd_info.bg_inode_table;
+    int inode_index = (inode_num - 1) % super.s_inodes_per_group;
+    //printf("Inode index is %d\n", inode_index);*/
+    struct ext2_inode i_info;
+    read_inode_info(inode_num, &i_info);
+    //printf("Inode mode is: %d\n", i_info.i_mode);
+    //char c = getchar();
+    //c = c;
+    if((i_info.i_mode & 0xf000) == 0x4000){
+        int i, j;
+        int num_entries;
+        for(i = 0; i < 12; i++){
+            if(i_info.i_block[i] == 0)
+                continue;
+            //printf("Data block %d is %d\n", i, i_info.i_block[i]);
+            //read_directory_data_block(i_info.block[i]);
+            struct ext2_dir_entry_2 *directory_entries;
+            int count;
+            directory_entries = read_directory_block(i_info.i_block[i], &count);
+
+            for (j = 0; j < count; j++){
+                if (directory_entries[j].inode == 0)
+                    continue;
+                struct ext2_inode dir_inode;
+                char names[255];
+                int k;
+                //printf("Inode number points to %d\n", directory_entries[j].inode);
+                read_inode_info(directory_entries[j].inode, &dir_inode);
+                for(k = 0; k < directory_entries[j].name_len; k++){
+                    names[k] = directory_entries[j].name[k];
+                }
+                names[k] = '\0';
+                printf("Found file/dir %s\n", names);
+                if((dir_inode.i_mode & 0xf000) == 0x4000 && strncmp(names, ".", directory_entries[j].name_len)
+                        &&strncmp(names, "..", directory_entries[j].name_len))
+                    traverse_directories(directory_entries[j].inode);
+            }
+
+        }
+
+        //Read singly indirect block
+        int singly_indirect_block = i_info.i_block[12];
+        if (singly_indirect_block != 0){
+            indirect_traversal(0, 1, singly_indirect_block, DIRECTORY_DATA_BLOCK);
+        }
+        
+        //Read doubly indirect block
+        int doubly_indirect_block = i_info.i_block[13];
+        if (doubly_indirect_block != 0){
+            indirect_traversal(0, 2, doubly_indirect_block, DIRECTORY_DATA_BLOCK);
+        }
+
+        //Read triply indirect block
+        int triply_indirect_block = i_info.i_block[14];
+        if (triply_indirect_block != 0){
+            indirect_traversal(0, 3, triply_indirect_block, DIRECTORY_DATA_BLOCK);
+        }
+    }
+    else if ((i_info.i_mode & 0xf000) == 0x8000){
+        //printf("Found file!\n");
+    }
+
+}
+
+struct ext2_dir_entry_2* read_directory_block(int block_num, int *count){
+    unsigned char buf[sector_size_bytes * sectors_per_block];
+    read_sectors(partition_start + (sectors_per_block * block_num), sectors_per_block, buf);
+    int offset = 0;
+    int i;
+    int j = 0;
+    int current_size = 0;
+    uint32_t inode_num;
+    uint16_t dir_length;
+    char name_len;
+    char file_type;
+    char names[255];
+    struct ext2_dir_entry_2 *directories = (struct ext2_dir_entry_2*)malloc(sizeof(struct ext2_dir_entry_2));
+
+    while(offset < (sectors_per_block * sector_size_bytes)){
+        struct ext2_dir_entry_2 *entry = (struct ext2_dir_entry_2 *)malloc(sizeof(struct ext2_dir_entry_2));
+        inode_num = read_bytes(buf, offset, 4);
+        dir_length = read_bytes(buf, offset + 4, 2);
+        name_len = read_bytes(buf, offset + 6, 1);
+        file_type = read_bytes(buf, offset + 7, 1);
+
+        entry->inode = inode_num;
+        entry->rec_len = dir_length;
+        entry->name_len = name_len;
+        entry->file_type = file_type;
+        for (i = 0; i < name_len; i++){
+            names[i] = *(buf + offset + 8 + i);
+            entry->name[i] = *(buf + offset + 8 + i);
+        }
+        names[i] = '\0';
+        offset = offset + dir_length;
+        directories = realloc(directories, (current_size + 1) * sizeof(struct ext2_dir_entry_2));
+        current_size++;
+        directories[j++] = *entry;
+    }
+    *count = j;
+    return directories;
+}
+
+/*void print_inode_of_file(uint32_t inode_num, char *path[]){
+    struct ext2_inode i_info;
+    read_inode_info(inode_table_start, inode_num, &i_info, 
+            &gd_info, &super, partition_start);
+    printf("Inode mode is: %d\n", i_info.i_mode);
+}*/
+
+void read_data_block(uint32_t block_num, db_type type){
+    if (type == DIRECTORY_DATA_BLOCK){
+        //printf("Reading directory data block %d\n", block_num);
+        unsigned char buf[sector_size_bytes * sectors_per_block];
+        read_sectors(partition_start + (sectors_per_block * block_num), sectors_per_block, buf);
+        //printf("Read sector %d\n", partition_start + (sectors_per_block * block_num));
+        int offset = 0;
+        uint16_t dir_length;
+
+        //char lions[5] = {'l', 'i', 'o', 'n', 's'};
+        char names[100];
+        int i;
+        int name_len;
+        char c;
+        int inode_num;
+
+        while(offset < (sectors_per_block * sector_size_bytes)){
+            name_len = read_bytes(buf, offset + 6, 1);
+            //printf("Name length is %d\n", read_bytes(buf, offset + 6, 1));
+            for (i = 0; i < name_len; i++)
+                names[i] = *(buf + offset + 8 + i);
+            names[i] = '\0';
+            inode_num = read_bytes(buf, offset, 4);
+            //if (inode_num == 0)
+            //    continue;
+            if(!strncmp(".", buf + offset + 8, name_len) || !strncmp("..", buf + offset + 8, name_len) || inode_num == 0){
+                if (inode_num != 0)
+                    printf("Found dir/file %s at inode %d\n", names, inode_num);
+                dir_length = read_bytes(buf, offset + 4, 2);
+                offset = offset + dir_length;
+                //printf("Offset is %d\n", offset);
+                continue;
+            }
+            printf("Found dir/file %s at inode %d\n", names, inode_num);
+            traverse_directories(inode_num);
+            //printf("Directory name is %s\n", offset + 8);
+            //if(!strncmp(lions, buf + offset + 8, 5)){
+                //printf("Lions found at inode %d\n", read_bytes(buf, offset, 4));
+            //}
+            dir_length = read_bytes(buf, offset + 4, 2);
+            offset = offset + dir_length;
+            //printf("Offset is %d\n", offset);
+        }
+        //c = getchar();
+        //c = c;
+    }
+    else {
+        //printf("File data block found\n");
+    }
+}
 
 
 /* read_sectors: read a specified number of sectors into a buffer.
@@ -283,33 +474,42 @@ void read_superblock_info(int part_number, struct ext2_super_block *superblock) 
     return;
 }
 
-void read_gd_info(int part_number, struct ext2_group_desc *gd_info) {
-    unsigned char buf[sector_size_bytes * sectors_per_block];
-    p_metadata part_detail;
-    get_partition_details(part_number, &part_detail);
-    read_sectors(part_detail.partition_start + (sectors_per_block * 2), sectors_per_block, buf);
-    gd_info->bg_block_bitmap = read_bytes(buf, 0, 4);
-    gd_info->bg_inode_bitmap = read_bytes(buf, 4, 4);
-    gd_info->bg_inode_table = read_bytes(buf, 8, 4);
-    gd_info->bg_free_blocks_count = read_bytes(buf, 12, 2);
-    gd_info->bg_free_inodes_count = read_bytes(buf, 14, 2);
+void read_gd_info(int block_group, struct ext2_group_desc *gd_info) {
+    //unsigned char buf[sector_size_bytes * sectors_per_block];
+    int offset = block_group * 32;
+    //read_sectors(partition_start + (sectors_per_block * 2), sectors_per_block, buf);
+    gd_info->bg_block_bitmap = read_bytes(group_descriptor_table, offset+0, 4);
+    gd_info->bg_inode_bitmap = read_bytes(group_descriptor_table, offset+4, 4);
+    gd_info->bg_inode_table = read_bytes(group_descriptor_table, offset+8, 4);
+    gd_info->bg_free_blocks_count = read_bytes(group_descriptor_table, offset+12, 2);
+    gd_info->bg_free_inodes_count = read_bytes(group_descriptor_table, offset+14, 2);
     return;
 }
 
-uint32_t get_inode_sector_offset(uint32_t inode_size, uint32_t inode_num) {
-    return inode_num/(sector_size_bytes/inode_size);
+uint32_t get_inode_sector_offset(uint32_t inode_size, uint32_t inode_index) {
+    return inode_index/(sector_size_bytes/inode_size);
 }
 
-void read_inode_info(uint32_t i_block_start, uint32_t inode_num, struct ext2_inode *i_info, 
-        struct ext2_group_desc *gd_info, struct ext2_super_block *superblock, uint32_t part_start) {
+void read_inode_info(uint32_t inode_num, struct ext2_inode *i_info) {
+    int block_group = (inode_num - 1) / super.s_inodes_per_group;
+    struct ext2_group_desc gd_info;
+    read_gd_info(block_group, &gd_info);
+    uint32_t inode_table_start = gd_info.bg_inode_table;
+    int inode_index = (inode_num - 1) % super.s_inodes_per_group;
     unsigned char buf[sector_size_bytes];
-    read_sectors(part_start + (i_block_start * sectors_per_block) + get_inode_sector_offset(superblock->s_inode_size, inode_num), 
+    read_sectors(partition_start + (inode_table_start * sectors_per_block) + get_inode_sector_offset(super.s_inode_size, inode_index), 
             1, buf);
-    uint32_t num_inodes_sector = sector_size_bytes / superblock->s_inode_size;
-    uint32_t offset = ((inode_num % num_inodes_sector) - 1) * superblock->s_inode_size; 
+    //printf("Read sector %d\n", partition_start + (i_block_start * sectors_per_block) + get_inode_sector_offset(super.s_inode_size, inode_index));
+    uint32_t num_inodes_sector = sector_size_bytes / super.s_inode_size;
+    uint32_t offset = ((inode_index % num_inodes_sector)) * super.s_inode_size; 
+    //printf("Inode number is %d\n", inode_index);
+    //printf("Offset is %d\n", offset);
     i_info->i_mode = read_bytes(buf, offset + 0, 2);
     i_info->i_size = read_bytes(buf, offset + 4, 4);
-    
+    int i;
+    for(i = 0; i < 15; i++){
+        i_info->i_block[i] = read_bytes(buf, offset + 40 + (i * 4), 4);
+    }    
 }
 
 bool inode_allocated(uint32_t inode_num, struct ext2_group_desc *gd_info, uint32_t part_start) {
