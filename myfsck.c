@@ -27,8 +27,10 @@ bool inode_allocated(uint32_t inode_num, struct ext2_group_desc *gd_info, uint32
 void read_data_block(uint32_t block_num, db_type type);
 void read_group_descriptor_table();
 void traverse_directories(int inode_num);
+void fix_directory_pointers(int inode_num, int parent_inode_num);
 void indirect_traversal(int curr_level, int max_indirection, int block_num, db_type type);
 struct ext2_dir_entry_2* read_directory_block(int block_num, int *count);
+void write_sectors (int64_t start_sector, unsigned int num_sectors, void *from);
 
 int block_size;
 int sectors_per_block;
@@ -110,7 +112,9 @@ int main (int argc, char **argv){
         //read_directory_data_block(i_info.block[i]);
         read_directory_data_block(i_info.i_block[i]);
     }*/
-    traverse_directories(2);
+    //traverse_directories(2);
+
+    fix_directory_pointers(2, 2);
 }
 
 void read_group_descriptor_table(){
@@ -139,28 +143,47 @@ void indirect_traversal(int curr_level, int max_indirection, int block_num, db_t
 
 }
 
-void traverse_directories(int inode_num){
-    /*int block_group = (inode_num - 1) / super.s_inodes_per_group;
-    //printf("Block group is %d\n", block_group);
+/*write_inode_info(int inode_num, ext2_inode inode){
+    int block_group = (inode_num - 1) / super.s_inodes_per_group;
     struct ext2_group_desc gd_info;
     read_gd_info(block_group, &gd_info);
-    //printf("Inode start block is %d\n", gd_info.bg_inode_table);
     uint32_t inode_table_start = gd_info.bg_inode_table;
     int inode_index = (inode_num - 1) % super.s_inodes_per_group;
-    //printf("Inode index is %d\n", inode_index);*/
+    unsigned char buf[sector_size_bytes];
+    read_sectors(partition_start + (inode_table_start * sectors_per_block) + get_inode_sector_offset(super.s_inode_size, inode_index), 
+            1, buf);
+
+}*/
+
+void set_directory_entry(int data_block, int directory_number, struct ext2_dir_entry_2 new_entry){
+    unsigned char buf[sector_size_bytes * sectors_per_block];
+    read_sectors(partition_start + (sectors_per_block * data_block), sectors_per_block, buf);
+    int i = 0;
+    int offset = 0;
+    int dir_length;
+    while (i < directory_number){
+        dir_length = read_bytes(buf, offset + 4, 2);
+        offset = offset + dir_length;
+        i++;
+    }
+    struct ext2_dir_entry_2 *old_entry = (struct ext2_dir_entry_2 *)(buf + offset);
+    old_entry->inode = new_entry.inode;
+    old_entry->rec_len = new_entry.rec_len;
+    old_entry->name_len = new_entry.name_len;
+    old_entry->file_type = new_entry.file_type;
+    write_sectors(partition_start + (sectors_per_block * data_block), sectors_per_block, buf);
+}
+
+void fix_directory_pointers(int inode_num, int parent_num){
+    printf("Checking directory pointers for %d\n", inode_num);
     struct ext2_inode i_info;
     read_inode_info(inode_num, &i_info);
-    //printf("Inode mode is: %d\n", i_info.i_mode);
-    //char c = getchar();
-    //c = c;
     if((i_info.i_mode & 0xf000) == 0x4000){
         int i, j;
         int num_entries;
         for(i = 0; i < 12; i++){
             if(i_info.i_block[i] == 0)
                 continue;
-            //printf("Data block %d is %d\n", i, i_info.i_block[i]);
-            //read_directory_data_block(i_info.block[i]);
             struct ext2_dir_entry_2 *directory_entries;
             int count;
             directory_entries = read_directory_block(i_info.i_block[i], &count);
@@ -171,16 +194,95 @@ void traverse_directories(int inode_num){
                 struct ext2_inode dir_inode;
                 char names[255];
                 int k;
-                //printf("Inode number points to %d\n", directory_entries[j].inode);
-                read_inode_info(directory_entries[j].inode, &dir_inode);
+
                 for(k = 0; k < directory_entries[j].name_len; k++){
                     names[k] = directory_entries[j].name[k];
                 }
                 names[k] = '\0';
-                printf("Found file/dir %s\n", names);
+
+		//Fix any directory pointer issues
+                if (!strncmp(names, ".", directory_entries[j].name_len)){
+                    if(!(directory_entries[j].inode == inode_num)){
+                        printf("Current directory points to %d when it should be %d\n", directory_entries[j].inode, inode_num);
+                        directory_entries[j].inode = inode_num;
+                        set_directory_entry(i_info.i_block[i], j, directory_entries[j]);
+                    }
+                }
+                if (!strncmp(names, "..", directory_entries[j].name_len)){
+                    if(!(directory_entries[j].inode == inode_num)){
+                        printf("Parent directory points to %d when it should be %d\n", directory_entries[j].inode, parent_num);
+                        directory_entries[j].inode = parent_num;
+                        set_directory_entry(i_info.i_block[i], j, directory_entries[j]);
+                    }
+                }
+
+		printf("Reading inode info for %d\n", directory_entries[j].inode);
+                read_inode_info(directory_entries[j].inode, &dir_inode);
+		printf("Read inode info for %d\n", directory_entries[j].inode);
                 if((dir_inode.i_mode & 0xf000) == 0x4000 && strncmp(names, ".", directory_entries[j].name_len)
-                        &&strncmp(names, "..", directory_entries[j].name_len))
+                        && strncmp(names, "..", directory_entries[j].name_len))
+                    fix_directory_pointers(directory_entries[j].inode, inode_num);
+            }
+
+        }
+
+        //Read singly indirect block
+        int singly_indirect_block = i_info.i_block[12];
+        if (singly_indirect_block != 0){
+            indirect_traversal(0, 1, singly_indirect_block, DIRECTORY_DATA_BLOCK);
+        }
+        
+        //Read doubly indirect block
+        int doubly_indirect_block = i_info.i_block[13];
+        if (doubly_indirect_block != 0){
+            indirect_traversal(0, 2, doubly_indirect_block, DIRECTORY_DATA_BLOCK);
+        }
+
+        //Read triply indirect block
+        int triply_indirect_block = i_info.i_block[14];
+        if (triply_indirect_block != 0){
+            indirect_traversal(0, 3, triply_indirect_block, DIRECTORY_DATA_BLOCK);
+        }
+    }
+    else if ((i_info.i_mode & 0xf000) == 0x8000){
+        //printf("Found file!\n");
+    }
+
+}
+
+void traverse_directories(int inode_num){
+    printf("Traversing inode number %d\n", inode_num);
+    struct ext2_inode i_info;
+    read_inode_info(inode_num, &i_info);
+    if((i_info.i_mode & 0xf000) == 0x4000){
+        int i, j;
+        int num_entries;
+        for(i = 0; i < 12; i++){
+            if(i_info.i_block[i] == 0)
+                continue;
+            struct ext2_dir_entry_2 *directory_entries;
+            int count;
+            directory_entries = read_directory_block(i_info.i_block[i], &count);
+
+            for (j = 0; j < count; j++){
+		printf("This directory has %d directory entries\n", count);
+                if (directory_entries[j].inode == 0)
+                    continue;
+                struct ext2_inode dir_inode;
+                char names[255];
+                int k;
+		printf("Reading inode info for %d\n", directory_entries[j].inode);
+                read_inode_info(directory_entries[j].inode, &dir_inode);
+		printf("Read inode info for %d\n", directory_entries[j].inode);
+                for(k = 0; k < directory_entries[j].name_len; k++){
+                    names[k] = directory_entries[j].name[k];
+                }
+                names[k] = '\0';
+                printf("Found file/dir %s at inode %d\n", names, inode_num);
+                if((dir_inode.i_mode & 0xf000) == 0x4000 && strncmp(names, ".", directory_entries[j].name_len)
+                        && strncmp(names, "..", directory_entries[j].name_len)){
                     traverse_directories(directory_entries[j].inode);
+		}
             }
 
         }
@@ -345,6 +447,50 @@ void read_sectors (int64_t start_sector, unsigned int num_sectors, void *into)
     }
 }
 
+/* write_sectors: write a buffer into a specified number of sectors.
+ *
+ * inputs:
+ *   int64 start_sector: the starting sector number to write.
+ *                	sector numbering starts with 0.
+ *   int numsectors: the number of sectors to write.  must be >= 1.
+ *   void *from: the requested number of sectors are copied from here.
+ *
+ * outputs:
+ *   int device [GLOBAL]: the disk into which to write.
+ *
+ * modifies:
+ *   int device [GLOBAL]
+ */
+void write_sectors (int64_t start_sector, unsigned int num_sectors, void *from)
+{
+    ssize_t ret;
+    int64_t lret;
+    int64_t sector_offset;
+    ssize_t bytes_to_write;
+
+    if (num_sectors == 1) {
+        printf("Reading sector  %"PRId64"\n", start_sector);
+    } else {
+        printf("Reading sectors %"PRId64"--%"PRId64"\n",
+               start_sector, start_sector + (num_sectors - 1));
+    }
+
+    sector_offset = start_sector * sector_size_bytes;
+
+    if ((lret = lseek64(device, sector_offset, SEEK_SET)) != sector_offset) {
+        fprintf(stderr, "Seek to position %"PRId64" failed: "
+                "returned %"PRId64"\n", sector_offset, lret);
+        exit(-1);
+    }
+
+    bytes_to_write = sector_size_bytes * num_sectors;
+
+    if ((ret = write(device, from, bytes_to_write)) != bytes_to_write) {
+        fprintf(stderr, "Write sector %"PRId64" length %d failed: "
+                "returned %"PRId64"\n", start_sector, num_sectors, ret);
+        exit(-1);
+    }
+}
 
 void get_partition_details(int part_number, p_metadata *data){
     if (part_number < 0) {
