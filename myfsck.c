@@ -26,7 +26,7 @@ void read_inode_info(uint32_t inode_num, struct ext2_inode *i_info);
 bool inode_allocated(uint32_t inode_num, char **bitmap);
 void read_data_block(uint32_t block_num, db_type type);
 void read_group_descriptor_table();
-void traverse_directories(int inode_num);
+void traverse_directories(int inode_num, bool count_links);
 void fix_directory_pointers(int inode_num, int parent_inode_num);
 void fix_dangling_nodes();
 void indirect_traversal(int curr_level, int max_indirection, int block_num, db_type type);
@@ -40,7 +40,8 @@ void add_to_lost_found(int inode_num);
 void set_directory_entry(int data_block, int directory_number, struct ext2_dir_entry_2 new_entry);
 void mark_subtrees(int inode_num);
 void increment_link_count(int inode_num);
-void write_inode_entry(int inode_num, struct ext_inode i_info);
+void write_inode_entry(int inode_num, struct ext2_inode i_info);
+uint32_t get_inode_sector_offset(uint32_t inode_size, uint32_t inode_index);
 
 int block_size;
 int sectors_per_block;
@@ -105,27 +106,32 @@ int main (int argc, char **argv){
         printf("-1\n");
 
     read_superblock_info(part_number, &super);
-    //printf("Magic number is 0x%02x\n", super.s_magic);
     block_size = 1024 << super.s_log_block_size;
     sectors_per_block = block_size / sector_size_bytes;
     group_descriptor_table = (char*)malloc(sectors_per_block * sector_size_bytes);
     read_group_descriptor_table();
     number_block_groups = round_div(super.s_blocks_count, super.s_blocks_per_group);
-    printf("Number of block groups is %d\n", number_block_groups);
     actual_inode_bitmap = (char **)malloc(number_block_groups * sizeof(char *));
     for (i = 0; i < number_block_groups; i++){
         actual_inode_bitmap[i] = (char *)calloc(sectors_per_block * sector_size_bytes, sizeof(char));
     }
 
     link_count = (int *)malloc((super.s_inodes_count + 1) * sizeof(int));
-    memset(link_count, -1, (super.s_inodes_count + 1));
+    memset(link_count, 0, (super.s_inodes_count + 1));
 
+    //Pass 1
     fix_directory_pointers(2, 2);
-    traverse_directories(2);
+
+    //Pass 2
+    traverse_directories(2, false);
     fix_dangling_nodes();
     fix_directory_pointers(2, 2);
 
-    check_link_count(2);
+    //Pass 3
+    traverse_directories(2, true);
+    traverse_directories(2, false);
+
+    //check_link_count(2);
 }
 
 void print_disk_bitmap(int group_number){
@@ -142,38 +148,13 @@ void fix_dangling_nodes(){
     struct ext2_inode i_info;
 
     //Add any isolated branches to our bitmap
-    printf("Printing allocate inodes in disk\n");
-    for(i = 11; i <= super.s_inodes_count; i++){
-        /*if(inode_allocated(i, NULL)){
-            read_inode_info(i, &i_info);
-            if (i_info.i_mode & 0xf000 == 0x4000){
-                mark_subtrees(i);
-            }
-        } */
-     if(inode_allocated(i, NULL)){
-      printf(",%d", i);   
-      mark_subtrees(31);
-     }
-    }
-    printf("\n");
-
-    printf("Printing actual inodes in disk\n");
     for(i = 11; i <= super.s_inodes_count; i++){
         if(inode_allocated(i, NULL)){
             read_inode_info(i, &i_info);
-            if (i_info.i_mode & 0xf000 == 0x4000){
+            if ((i_info.i_mode & 0xf000) == 0x4000){
                 mark_subtrees(i);
             }
         } 
-    }
-
-    for(i = 0; i < number_block_groups; i++){
-        uint32_t bitmap_block = read_bytes(group_descriptor_table, i*32 + 4, 4);
-        unsigned char buf[sector_size_bytes * sectors_per_block];
-        read_sectors(partition_start + (bitmap_block * sectors_per_block), sectors_per_block, buf);
-        printf("\n");
-        printf("Inode bitmap for block group %d\n", i);
-        print_sector(buf);
     }
 
     //Add to lost+found
@@ -187,11 +168,25 @@ void fix_dangling_nodes(){
 }
 
 void write_inode_entry(int inode_num, struct ext2_inode i_info){
+    int block_group = (inode_num - 1) / super.s_inodes_per_group;
+    int offset = block_group * 32;
+    int inode_table_start = read_bytes(group_descriptor_table, offset + 8, 4);
+    int inode_index = (inode_num - 1) % super.s_inodes_per_group;
 
+    unsigned char buf[sector_size_bytes * sectors_per_block];
+    read_sectors(partition_start + (inode_table_start * sectors_per_block) + get_inode_sector_offset(super.s_inode_size, inode_index), 
+            1, buf);
+
+    uint32_t num_inodes_sector = sector_size_bytes / super.s_inode_size;
+    offset = ((inode_index % num_inodes_sector)) * super.s_inode_size; 
+
+    struct ext2_inode *new_inode = (struct ext2_inode*)(buf + offset);
+    new_inode->i_links_count = i_info.i_links_count;
+    write_sectors(partition_start + (inode_table_start * sectors_per_block) + get_inode_sector_offset(super.s_inode_size, inode_index),
+            1, buf);
 }
 
 void add_directory_entry(int inode_num, struct ext2_dir_entry_2 new_entry){
-    printf("Adding a directory entry to %d\n", inode_num);
     bool new_block = false;
     struct ext2_inode i_info;
     read_inode_info(lost_found, &i_info);
@@ -230,7 +225,6 @@ void add_directory_entry(int inode_num, struct ext2_dir_entry_2 new_entry){
 }
 
 void add_to_lost_found(int inode_num){
-    printf("Adding inode %d to lost+found\n", inode_num);
     int i, name_len;
     char name[255];
     name_len = sprintf(name, "%d", inode_num);
@@ -343,7 +337,6 @@ void set_directory_entry(int data_block, int directory_number, struct ext2_dir_e
 }
 
 void fix_directory_pointers(int inode_num, int parent_num){
-    //printf("Checking directory pointers for %d\n", inode_num);
     struct ext2_inode i_info;
     read_inode_info(inode_num, &i_info);
     if((i_info.i_mode & 0xf000) == 0x4000){
@@ -453,13 +446,12 @@ void mark_subtrees(int inode_num){
     }
 }
 
-void traverse_directories(int inode_num){
+void traverse_directories(int inode_num, bool count_links){
     mark_actual_inode(inode_num);   //Kepp track of the reachable inodes
-    //printf("Traversing inode number %d\n", inode_num);
     struct ext2_inode i_info;
     read_inode_info(inode_num, &i_info);
 
-    if (link_count[inode_num] != -1){
+    if (link_count[inode_num] != 0 && !count_links){
         if (link_count[inode_num] != i_info.i_links_count){
             printf("Incorrect link count %d for inode %d. Should be %d.\n", 
                     i_info.i_links_count, inode_num, link_count[inode_num]);
@@ -478,25 +470,22 @@ void traverse_directories(int inode_num){
             directory_entries = read_directory_block(i_info.i_block[i], &count);
 
             for (j = 0; j < count; j++){
-                //printf("This directory has %d directory entries\n", count);
                 if (directory_entries[j].inode == 0)
                     continue;
                 struct ext2_inode dir_inode;
                 char names[255];
                 int k;
                 mark_actual_inode(directory_entries[j].inode);
-                increment_link_count(directory_entries[j].inode);
-                //printf("Reading inode info for %d\n", directory_entries[j].inode);
+                if (count_links)
+                    increment_link_count(directory_entries[j].inode);
                 read_inode_info(directory_entries[j].inode, &dir_inode);
-                //printf("Read inode info for %d\n", directory_entries[j].inode);
                 for(k = 0; k < directory_entries[j].name_len; k++){
                     names[k] = directory_entries[j].name[k];
                 }
                 names[k] = '\0';
-                //printf("Found file/dir %s at inode %d\n", names, inode_num);
-                if((dir_inode.i_mode & 0xf000) == 0x4000 && strncmp(names, ".", directory_entries[j].name_len)
+                if(strncmp(names, ".", directory_entries[j].name_len)
                         && strncmp(names, "..", directory_entries[j].name_len)){
-                    traverse_directories(directory_entries[j].inode);
+                    traverse_directories(directory_entries[j].inode, count_links);
                 }
             }
 
@@ -522,7 +511,6 @@ void traverse_directories(int inode_num){
     }
     else if ((i_info.i_mode & 0xf000) == 0x8000){
         mark_actual_inode(inode_num);
-        //printf("Found file!\n");
     }
 
 }
@@ -565,44 +553,6 @@ struct ext2_dir_entry_2* read_directory_block(int block_num, int *count){
     *count = j;
     return directories;
 }
-
-void read_data_block(uint32_t block_num, db_type type){
-    if (type == DIRECTORY_DATA_BLOCK){
-        unsigned char buf[sector_size_bytes * sectors_per_block];
-        read_sectors(partition_start + (sectors_per_block * block_num), sectors_per_block, buf);
-        int offset = 0;
-        uint16_t dir_length;
-
-        char names[100];
-        int i;
-        int name_len;
-        char c;
-        int inode_num;
-
-        while(offset < (sectors_per_block * sector_size_bytes)){
-            name_len = read_bytes(buf, offset + 6, 1);
-            for (i = 0; i < name_len; i++)
-                names[i] = *(buf + offset + 8 + i);
-            names[i] = '\0';
-            inode_num = read_bytes(buf, offset, 4);
-            if(!strncmp(".", buf + offset + 8, name_len) || !strncmp("..", buf + offset + 8, name_len) || inode_num == 0){
-                if (inode_num != 0)
-                    printf("Found dir/file %s at inode %d\n", names, inode_num);
-                dir_length = read_bytes(buf, offset + 4, 2);
-                offset = offset + dir_length;
-                continue;
-            }
-            printf("Found dir/file %s at inode %d\n", names, inode_num);
-            traverse_directories(inode_num);
-            dir_length = read_bytes(buf, offset + 4, 2);
-            offset = offset + dir_length;
-        }
-    }
-    else {
-        //printf("File data block found\n");
-    }
-}
-
 
 /* read_sectors: read a specified number of sectors into a buffer.
  *
