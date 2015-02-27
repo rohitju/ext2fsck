@@ -26,22 +26,24 @@ void read_inode_info(uint32_t inode_num, struct ext2_inode *i_info);
 bool inode_allocated(uint32_t inode_num, char **bitmap);
 void read_data_block(uint32_t block_num, db_type type);
 void read_group_descriptor_table();
-void traverse_directories(int inode_num, bool count_links);
+void traverse_directories(int inode_num, bool count_links, bool fix_blocks);
 void fix_directory_pointers(int inode_num, int parent_inode_num);
 void fix_dangling_nodes();
-void indirect_traversal(int curr_level, int max_indirection, int block_num, db_type type);
+void indirect_traversal(int curr_level, int max_indirection, int block_num, bool fix_blocks);
 struct ext2_dir_entry_2* read_directory_block(int block_num, int *count);
 void write_sectors (int64_t start_sector, unsigned int num_sectors, void *from);
 void print_sector (unsigned char *buf);
 void print_disk_bitmap(int block_group_num);
 void print_actual_bitmap(int block_group_num);
 void mark_actual_inode(int inode_num);
+void mark_actual_block(int block_num);
 void add_to_lost_found(int inode_num);
 void set_directory_entry(int data_block, int directory_number, struct ext2_dir_entry_2 new_entry);
 void mark_subtrees(int inode_num);
 void increment_link_count(int inode_num);
 void write_inode_entry(int inode_num, struct ext2_inode i_info);
 uint32_t get_inode_sector_offset(uint32_t inode_size, uint32_t inode_index);
+void persist_block_bitmap();
 
 int block_size;
 int sectors_per_block;
@@ -52,6 +54,7 @@ int lost_found;
 char **actual_inode_bitmap;
 int number_block_groups;
 int *link_count;
+char **actual_block_bitmap;
 
 unsigned int round_div(unsigned int dividend, unsigned int divisor)
 {
@@ -62,6 +65,7 @@ int main (int argc, char **argv){
     int part_number;
     char *image_path;
     int c, i;
+    bool f = false;
     while ((c = getopt (argc, argv, "p:i:")) != -1) {
         switch (c)
         {
@@ -85,6 +89,9 @@ int main (int argc, char **argv){
                     fprintf (stderr, "Unknown option character `\\x%x'.\n", optopt);
                 exit(-1);
                 break;
+            case 'f':
+                f = true;
+                break;
             default:
                 break;
         }
@@ -105,6 +112,10 @@ int main (int argc, char **argv){
     else 
         printf("-1\n");
 
+    if (f){
+
+    }
+
     read_superblock_info(part_number, &super);
     block_size = 1024 << super.s_log_block_size;
     sectors_per_block = block_size / sector_size_bytes;
@@ -116,22 +127,35 @@ int main (int argc, char **argv){
         actual_inode_bitmap[i] = (char *)calloc(sectors_per_block * sector_size_bytes, sizeof(char));
     }
 
+    int block_start;
+    unsigned char buf[sector_size_bytes * sectors_per_block];
+    actual_block_bitmap = (char **)malloc(number_block_groups * sizeof(char *));
+    for (i = 0; i < number_block_groups; i++){
+        actual_block_bitmap[i] = (char *)calloc(sectors_per_block * sector_size_bytes, sizeof(char));
+        block_start = read_bytes(group_descriptor_table, 32 * i, 4); 
+        read_sectors(partition_start + (block_start * sectors_per_block), sectors_per_block, buf);
+        memcpy(actual_block_bitmap[i], buf, sectors_per_block * sector_size_bytes);
+    }
+
     link_count = (int *)malloc((super.s_inodes_count + 1) * sizeof(int));
     memset(link_count, 0, (super.s_inodes_count + 1));
+    
+    for (i = 1; i <= 255; i++)
+        mark_actual_block(i);
 
     //Pass 1
     fix_directory_pointers(2, 2);
 
     //Pass 2
-    traverse_directories(2, false);
+    traverse_directories(2, false, false);
     fix_dangling_nodes();
     fix_directory_pointers(2, 2);
 
     //Pass 3
-    traverse_directories(2, true);
-    traverse_directories(2, false);
+    traverse_directories(2, true, false);
+    traverse_directories(2, false, true);
 
-    //check_link_count(2);
+    persist_block_bitmap();
 }
 
 void print_disk_bitmap(int group_number){
@@ -270,27 +294,21 @@ void read_group_descriptor_table(){
     read_sectors(partition_start + (sectors_per_block * 2), sectors_per_block, group_descriptor_table);
 }
 
-void indirect_traversal(int curr_level, int max_indirection, int block_num, db_type type){
+void indirect_traversal(int curr_level, int max_indirection, int block_num, bool fix_blocks){
+    if (fix_blocks)
+        mark_actual_block(block_num);
+    if(curr_level == max_indirection){
+        return;
+    }
     int offset = 0;
     unsigned char buf[sector_size_bytes * sectors_per_block];
     read_sectors(partition_start + (sectors_per_block * block_num), sectors_per_block, buf);
-
-    printf("Current level is %d for max_indirection %d and type is %d\n", curr_level, max_indirection, type);
-
-    if(curr_level == max_indirection){
-        int count;
-        read_directory_block(block_num, &count);
+    while (offset < (sectors_per_block * sector_size_bytes)){
+        int curr_block = read_bytes(buf, offset, 4);
+        if(curr_block != 0)
+            indirect_traversal(curr_level + 1, max_indirection, curr_block, fix_blocks);
+        offset  = offset + 4;
     }
-
-
-    else {
-        while (offset < (sectors_per_block * sector_size_bytes)){
-            int curr_block = read_bytes(buf, offset, 4);
-            indirect_traversal(curr_level + 1, max_indirection, curr_block, type);
-            offset  = offset + 4;
-        }
-    }
-
 }
 
 void print_sector (unsigned char *buf)
@@ -306,7 +324,6 @@ void print_sector (unsigned char *buf)
 }
 
 void mark_actual_inode(int inode_num){
-    //printf("mzrking actual inode %d\n", inode_num);
     int block_group = (inode_num - 1) / super.s_inodes_per_group;
     int inode_index = (inode_num - 1) % super.s_inodes_per_group;
     int inode_byte_index = inode_index / 8;
@@ -389,29 +406,7 @@ void fix_directory_pointers(int inode_num, int parent_num){
             }
 
         }
-
-        //Read singly indirect block
-        int singly_indirect_block = i_info.i_block[12];
-        if (singly_indirect_block != 0){
-            indirect_traversal(0, 1, singly_indirect_block, DIRECTORY_DATA_BLOCK);
-        }
-
-        //Read doubly indirect block
-        int doubly_indirect_block = i_info.i_block[13];
-        if (doubly_indirect_block != 0){
-            indirect_traversal(0, 2, doubly_indirect_block, DIRECTORY_DATA_BLOCK);
-        }
-
-        //Read triply indirect block
-        int triply_indirect_block = i_info.i_block[14];
-        if (triply_indirect_block != 0){
-            indirect_traversal(0, 3, triply_indirect_block, DIRECTORY_DATA_BLOCK);
-        }
     }
-    else if ((i_info.i_mode & 0xf000) == 0x8000){
-        //printf("Found file!\n");
-    }
-
 }
 
 void mark_subtrees(int inode_num){
@@ -446,7 +441,30 @@ void mark_subtrees(int inode_num){
     }
 }
 
-void traverse_directories(int inode_num, bool count_links){
+void mark_actual_block(int block_num){
+    int block_group = (block_num - 1) / super.s_blocks_per_group;
+    int block_index = (block_num - 1) % super.s_blocks_per_group;
+    int block_byte_index = block_index / 8;
+    int block_byte_offset = (block_index % 8);
+    int mask = 1 << block_byte_offset;
+    if((actual_block_bitmap[block_group][block_byte_index] & mask) == 0){
+        printf("Allocated block %d is not marked as allocated. Fixed\n", block_num);
+        actual_block_bitmap[block_group][block_byte_index] |= mask; 
+    }
+
+}
+
+void persist_block_bitmap(){
+    int i;
+    int block_start;
+    for (i = 0; i < number_block_groups; i++){
+        printf("Persisting block group number %d\n", i);
+        block_start = read_bytes(group_descriptor_table, 32 * i, 4); 
+        write_sectors(partition_start + (block_start * sectors_per_block), sectors_per_block, actual_block_bitmap[i]);
+    }
+}
+
+void traverse_directories(int inode_num, bool count_links, bool fix_blocks){
     mark_actual_inode(inode_num);   //Kepp track of the reachable inodes
     struct ext2_inode i_info;
     read_inode_info(inode_num, &i_info);
@@ -465,6 +483,8 @@ void traverse_directories(int inode_num, bool count_links){
         for(i = 0; i < 12; i++){
             if(i_info.i_block[i] == 0)
                 continue;
+            if (fix_blocks)
+                mark_actual_block(i_info.i_block[i]);
             struct ext2_dir_entry_2 *directory_entries;
             int count;
             directory_entries = read_directory_block(i_info.i_block[i], &count);
@@ -485,32 +505,41 @@ void traverse_directories(int inode_num, bool count_links){
                 names[k] = '\0';
                 if(strncmp(names, ".", directory_entries[j].name_len)
                         && strncmp(names, "..", directory_entries[j].name_len)){
-                    traverse_directories(directory_entries[j].inode, count_links);
+                    traverse_directories(directory_entries[j].inode, count_links, fix_blocks);
                 }
             }
 
         }
-
+    }
+    else if ((i_info.i_mode & 0xf000) == 0x8000){
+        int i;
+        mark_actual_inode(inode_num);
+        for(i = 0; i < 12; i++){
+            if(i_info.i_block[i] == 0)
+                continue;
+            if (fix_blocks)
+                mark_actual_block(i_info.i_block[i]);
+        }
         //Read singly indirect block
         int singly_indirect_block = i_info.i_block[12];
         if (singly_indirect_block != 0){
-            indirect_traversal(0, 1, singly_indirect_block, DIRECTORY_DATA_BLOCK);
+            //mark_actual_block(singly_indirect_block)
+            indirect_traversal(0, 1, singly_indirect_block, fix_blocks);
         }
 
         //Read doubly indirect block
         int doubly_indirect_block = i_info.i_block[13];
         if (doubly_indirect_block != 0){
-            indirect_traversal(0, 2, doubly_indirect_block, DIRECTORY_DATA_BLOCK);
+            //mark_actual_block(doubly_indirect_block);
+            indirect_traversal(0, 2, doubly_indirect_block, fix_blocks);
         }
 
         //Read triply indirect block
         int triply_indirect_block = i_info.i_block[14];
         if (triply_indirect_block != 0){
-            indirect_traversal(0, 3, triply_indirect_block, DIRECTORY_DATA_BLOCK);
+            //mark_actual_block(triply_indirect_block);
+            indirect_traversal(0, 3, triply_indirect_block, fix_blocks);
         }
-    }
-    else if ((i_info.i_mode & 0xf000) == 0x8000){
-        mark_actual_inode(inode_num);
     }
 
 }
@@ -554,20 +583,6 @@ struct ext2_dir_entry_2* read_directory_block(int block_num, int *count){
     return directories;
 }
 
-/* read_sectors: read a specified number of sectors into a buffer.
- *
- * inputs:
- *   int64 start_sector: the starting sector number to read.
- *                       sector numbering starts with 0.
- *   int numsectors: the number of sectors to read.  must be >= 1.
- *   int device [GLOBAL]: the disk from which to read.
- *
- * outputs:
- *   void *into: the requested number of sectors are copied into here.
- *
- * modifies:
- *   void *into
- */
 void read_sectors (int64_t start_sector, unsigned int num_sectors, void *into)
 {
     ssize_t ret;
@@ -592,20 +607,6 @@ void read_sectors (int64_t start_sector, unsigned int num_sectors, void *into)
     }
 }
 
-/* write_sectors: write a buffer into a specified number of sectors.
- *
- * inputs:
- *   int64 start_sector: the starting sector number to write.
- *                	sector numbering starts with 0.
- *   int numsectors: the number of sectors to write.  must be >= 1.
- *   void *from: the requested number of sectors are copied from here.
- *
- * outputs:
- *   int device [GLOBAL]: the disk into which to write.
- *
- * modifies:
- *   int device [GLOBAL]
- */
 void write_sectors (int64_t start_sector, unsigned int num_sectors, void *from)
 {
     ssize_t ret;
