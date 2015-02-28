@@ -5,6 +5,7 @@
 #include<fcntl.h>
 #include<inttypes.h>
 #include<stdbool.h>
+#include<sysexits.h>
 #include "ext2_fs.h"
 
 static int device;
@@ -44,6 +45,8 @@ void increment_link_count(int inode_num);
 void write_inode_entry(int inode_num, struct ext2_inode i_info);
 uint32_t get_inode_sector_offset(uint32_t inode_size, uint32_t inode_index);
 void persist_block_bitmap();
+void check_partition();
+void free_memory();
 
 int block_size;
 int sectors_per_block;
@@ -64,21 +67,26 @@ unsigned int round_div(unsigned int dividend, unsigned int divisor)
 int main (int argc, char **argv){
     int part_number;
     char *image_path;
-    int c, i;
-    bool f = false;
-    while ((c = getopt (argc, argv, "p:i:")) != -1) {
+    int c, i, j;
+    bool all = false;
+    int check_part = -1;
+    while ((c = getopt (argc, argv, ":p:i:f:")) != -1) {
         switch (c)
         {
             case 'p':
                 part_number = atoi(optarg);
                 if(part_number <= 0) {
                     fprintf(stderr, "Option 'p' requires a positive integer argument\n. Will exit now...");
-                    exit(-1);
+                    exit(EX_USAGE);
                 }
                 break;
             case 'i':
                 image_path = optarg;
                 strncpy(image_path, optarg, 100);
+                break;
+            case 'f':
+                check_part = atoi(optarg);
+                all = true;
                 break;
             case '?':
                 if (optopt == 'p' || optopt == 'i')
@@ -87,10 +95,7 @@ int main (int argc, char **argv){
                     fprintf (stderr, "Unknown option `-%c'.\n", optopt);
                 else
                     fprintf (stderr, "Unknown option character `\\x%x'.\n", optopt);
-                exit(-1);
-                break;
-            case 'f':
-                f = true;
+                exit(EX_USAGE);
                 break;
             default:
                 break;
@@ -100,49 +105,118 @@ int main (int argc, char **argv){
 
     if ((device = open(image_path, O_RDWR)) == -1) {
         perror("Could not open device file");
-        exit(-1);
+        exit(EX_NOINPUT);
     } 
     p_metadata part_detail;
-    get_partition_details(part_number, &part_detail);
-    partition_start = part_detail.partition_start;
-    if (part_detail.part_type != 0xFF) {
-        printf("0x%02X %d %d\n", part_detail.part_type, part_detail.partition_start, 
-                part_detail.partition_length);
+    if(!all) {
+        get_partition_details(part_number, &part_detail);
+        partition_start = part_detail.partition_start;
+        if (part_detail.part_type != 0xFF) {
+            printf("0x%02X %d %d\n", part_detail.part_type, part_detail.partition_start, 
+                    part_detail.partition_length);
+        }
+        else 
+            printf("-1\n");
     }
-    else 
-        printf("-1\n");
+    else if (check_part == 0){ //Check errors of all partitions
+        j = 1;
+        while (true){
+            printf("Fixing errors of partition %d\n",j);
+            memset(&part_detail, 0, sizeof(p_metadata));   
+            get_partition_details(j, &part_detail);
+            if (part_detail.part_type == 0xFF) {
+                exit(EX_OK);
+            }
+            if(part_detail.part_type != 0x83){
+                j++;
+                continue;
+            }
+            partition_start = part_detail.partition_start;
+            read_superblock_info(j, &super);
+            block_size = 1024 << super.s_log_block_size;
+            sectors_per_block = block_size / sector_size_bytes;
+            group_descriptor_table = (char*)malloc(sectors_per_block * sector_size_bytes);
+            read_group_descriptor_table();
+            number_block_groups = round_div(super.s_blocks_count, super.s_blocks_per_group);
+            actual_inode_bitmap = (char **)malloc(number_block_groups * sizeof(char *));
+            for (i = 0; i < number_block_groups; i++){
+                actual_inode_bitmap[i] = (char *)calloc(sectors_per_block * sector_size_bytes, sizeof(char));
+            }
+            int block_start;
+            unsigned char buf[sector_size_bytes * sectors_per_block];
+            actual_block_bitmap = (char **)malloc(number_block_groups * sizeof(char *));
+            for (i = 0; i < number_block_groups; i++){
+                actual_block_bitmap[i] = (char *)calloc(sectors_per_block * sector_size_bytes, sizeof(char));
+                block_start = read_bytes(group_descriptor_table, 32 * i, 4); 
+                read_sectors(partition_start + (block_start * sectors_per_block), sectors_per_block, buf);
+                memcpy(actual_block_bitmap[i], buf, sectors_per_block * sector_size_bytes);
+            }
 
-    if (f){
-
+            link_count = (int *)malloc((super.s_inodes_count + 1) * sizeof(int));
+            memset(link_count, 0, (super.s_inodes_count + 1));
+            
+            for (i = 1; i <= 255; i++)
+                mark_actual_block(i);
+            check_partition();
+            j++;
+        }
     }
+    else {  //Check for errors on a single partition
+        memset(&part_detail, 0, sizeof(p_metadata));   
+        get_partition_details(check_part, &part_detail);
+        if (part_detail.part_type != 0x83) {
+            printf("Invalid partition type\n");
+            exit(EX_DATAERR);
+        }
+        printf("Checking partition %d\n", check_part);
+        partition_start = part_detail.partition_start;
+        read_superblock_info(check_part, &super);
+        block_size = 1024 << super.s_log_block_size;
+        sectors_per_block = block_size / sector_size_bytes;
+        group_descriptor_table = (char*)malloc(sectors_per_block * sector_size_bytes);
+        read_group_descriptor_table();
+        number_block_groups = round_div(super.s_blocks_count, super.s_blocks_per_group);
+        actual_inode_bitmap = (char **)malloc(number_block_groups * sizeof(char *));
+        for (i = 0; i < number_block_groups; i++){
+            actual_inode_bitmap[i] = (char *)calloc(sectors_per_block * sector_size_bytes, sizeof(char));
+        }
 
-    read_superblock_info(part_number, &super);
-    block_size = 1024 << super.s_log_block_size;
-    sectors_per_block = block_size / sector_size_bytes;
-    group_descriptor_table = (char*)malloc(sectors_per_block * sector_size_bytes);
-    read_group_descriptor_table();
-    number_block_groups = round_div(super.s_blocks_count, super.s_blocks_per_group);
-    actual_inode_bitmap = (char **)malloc(number_block_groups * sizeof(char *));
+        int block_start;
+        unsigned char buf[sector_size_bytes * sectors_per_block];
+        actual_block_bitmap = (char **)malloc(number_block_groups * sizeof(char *));
+        for (i = 0; i < number_block_groups; i++){
+            actual_block_bitmap[i] = (char *)calloc(sectors_per_block * sector_size_bytes, sizeof(char));
+            block_start = read_bytes(group_descriptor_table, 32 * i, 4); 
+            read_sectors(partition_start + (block_start * sectors_per_block), sectors_per_block, buf);
+            memcpy(actual_block_bitmap[i], buf, sectors_per_block * sector_size_bytes);
+        }
+
+        link_count = (int *)malloc((super.s_inodes_count + 1) * sizeof(int));
+        memset(link_count, 0, (super.s_inodes_count + 1));
+        
+        for (i = 1; i <= 255; i++)
+            mark_actual_block(i);
+        check_partition();
+    }
+    free_memory();
+    exit(EX_OK);
+}
+
+void free_memory(){
+    int i;
+    free(link_count);
     for (i = 0; i < number_block_groups; i++){
-        actual_inode_bitmap[i] = (char *)calloc(sectors_per_block * sector_size_bytes, sizeof(char));
+        free(actual_block_bitmap[i]);
     }
-
-    int block_start;
-    unsigned char buf[sector_size_bytes * sectors_per_block];
-    actual_block_bitmap = (char **)malloc(number_block_groups * sizeof(char *));
+    free(actual_block_bitmap);
     for (i = 0; i < number_block_groups; i++){
-        actual_block_bitmap[i] = (char *)calloc(sectors_per_block * sector_size_bytes, sizeof(char));
-        block_start = read_bytes(group_descriptor_table, 32 * i, 4); 
-        read_sectors(partition_start + (block_start * sectors_per_block), sectors_per_block, buf);
-        memcpy(actual_block_bitmap[i], buf, sectors_per_block * sector_size_bytes);
+        free(actual_inode_bitmap[i]);
     }
+    free(actual_inode_bitmap);
+    free(group_descriptor_table);
+}
 
-    link_count = (int *)malloc((super.s_inodes_count + 1) * sizeof(int));
-    memset(link_count, 0, (super.s_inodes_count + 1));
-    
-    for (i = 1; i <= 255; i++)
-        mark_actual_block(i);
-
+void check_partition(){
     //Pass 1
     fix_directory_pointers(2, 2);
 
@@ -155,18 +229,11 @@ int main (int argc, char **argv){
     traverse_directories(2, true, false);
     traverse_directories(2, false, true);
 
+    //Pass 4
     persist_block_bitmap();
 }
 
-void print_disk_bitmap(int group_number){
-    int offset = group_number * 32;
-    int bitmap_block = read_bytes(group_descriptor_table, offset + 4, 4);
-    unsigned char buf[sector_size_bytes * sectors_per_block];
-    read_sectors(partition_start + (sectors_per_block * bitmap_block), sectors_per_block, buf);
-    print_sector(buf);
-
-}
-
+//Find inodes which are not connected to the directory tree
 void fix_dangling_nodes(){
     int i;
     struct ext2_inode i_info;
@@ -210,6 +277,7 @@ void write_inode_entry(int inode_num, struct ext2_inode i_info){
             1, buf);
 }
 
+//Add a new directory entry to a data block
 void add_directory_entry(int inode_num, struct ext2_dir_entry_2 new_entry){
     bool new_block = false;
     struct ext2_inode i_info;
@@ -248,6 +316,7 @@ void add_directory_entry(int inode_num, struct ext2_dir_entry_2 new_entry){
 
 }
 
+//Add an inode to the lost+found directory
 void add_to_lost_found(int inode_num){
     int i, name_len;
     char name[255];
@@ -286,14 +355,11 @@ void increment_link_count(int inode_num){
     link_count[inode_num]++;
 }
 
-void print_actual_bitmap(int group_number){
-    print_sector(actual_inode_bitmap[group_number]);
-}
-
 void read_group_descriptor_table(){
     read_sectors(partition_start + (sectors_per_block * 2), sectors_per_block, group_descriptor_table);
 }
 
+//Traverse indirected blocks
 void indirect_traversal(int curr_level, int max_indirection, int block_num, bool fix_blocks){
     if (fix_blocks)
         mark_actual_block(block_num);
@@ -311,18 +377,7 @@ void indirect_traversal(int curr_level, int max_indirection, int block_num, bool
     }
 }
 
-void print_sector (unsigned char *buf)
-{
-    int i;
-    for (i = 0; i < sector_size_bytes; i++) {
-        printf("%02x", buf[i]);
-        if (!((i+1) % 32))
-            printf("\n");      /* line break after 32 bytes */
-        else if (!((i+1) % 4))
-            printf(" ");   /* space after 4 bytes */
-    }
-}
-
+//Mark inode number as allocated
 void mark_actual_inode(int inode_num){
     int block_group = (inode_num - 1) / super.s_inodes_per_group;
     int inode_index = (inode_num - 1) % super.s_inodes_per_group;
@@ -332,6 +387,7 @@ void mark_actual_inode(int inode_num){
     actual_inode_bitmap[block_group][inode_byte_index] |= mask; 
 }
 
+//Set a directory entry in a given data block
 void set_directory_entry(int data_block, int directory_number, struct ext2_dir_entry_2 new_entry){
     unsigned char buf[sector_size_bytes * sectors_per_block];
     read_sectors(partition_start + (sectors_per_block * data_block), sectors_per_block, buf);
@@ -353,6 +409,7 @@ void set_directory_entry(int data_block, int directory_number, struct ext2_dir_e
     write_sectors(partition_start + (sectors_per_block * data_block), sectors_per_block, buf);
 }
 
+//Check that "." and ".." point to the right inode numbers
 void fix_directory_pointers(int inode_num, int parent_num){
     struct ext2_inode i_info;
     read_inode_info(inode_num, &i_info);
@@ -379,17 +436,17 @@ void fix_directory_pointers(int inode_num, int parent_num){
                 names[k] = '\0';
 
                 //Fix any directory pointer issues
-                if (!strncmp(names, ".", directory_entries[j].name_len)){
-                    if(!(directory_entries[j].inode == inode_num)){
-                        //printf("Current directory points to %d when it should be %d\n", directory_entries[j].inode, inode_num);
-                        directory_entries[j].inode = inode_num;
+                if (!strcmp(names, "..")){
+                    if(!(directory_entries[j].inode == parent_num)){
+                        printf("Parent directory points to %d when it should be %d\n", directory_entries[j].inode, parent_num);
+                        directory_entries[j].inode = parent_num;
                         set_directory_entry(i_info.i_block[i], j, directory_entries[j]);
                     }
                 }
-                if (!strncmp(names, "..", directory_entries[j].name_len)){
+                if (!strcmp(names, ".")){
                     if(!(directory_entries[j].inode == inode_num)){
-                        //printf("Parent directory points to %d when it should be %d\n", directory_entries[j].inode, parent_num);
-                        directory_entries[j].inode = parent_num;
+                        printf("Current directory points to %d when it should be %d\n", directory_entries[j].inode, inode_num);
+                        directory_entries[j].inode = inode_num;
                         set_directory_entry(i_info.i_block[i], j, directory_entries[j]);
                     }
                 }
@@ -397,11 +454,9 @@ void fix_directory_pointers(int inode_num, int parent_num){
                     lost_found = directory_entries[j].inode;
                 }
 
-                //printf("Reading inode info for %d\n", directory_entries[j].inode);
                 read_inode_info(directory_entries[j].inode, &dir_inode);
-                //printf("Read inode info for %d\n", directory_entries[j].inode);
-                if((dir_inode.i_mode & 0xf000) == 0x4000 && strncmp(names, ".", directory_entries[j].name_len)
-                        && strncmp(names, "..", directory_entries[j].name_len))
+                if((dir_inode.i_mode & 0xf000) == 0x4000 && strcmp(names, ".")
+                        && strcmp(names, ".."))
                     fix_directory_pointers(directory_entries[j].inode, inode_num);
             }
 
@@ -409,8 +464,8 @@ void fix_directory_pointers(int inode_num, int parent_num){
     }
 }
 
+//Find disconnected subtrees in the directory tree and mark them except the root
 void mark_subtrees(int inode_num){
-    //printf("marking subtree for inode %d\n", inode_num);
     struct ext2_inode i_info;
     read_inode_info(inode_num, &i_info);
     if((i_info.i_mode & 0xf000) == 0x4000){
@@ -433,7 +488,7 @@ void mark_subtrees(int inode_num){
                 }
                 names[k] = '\0';
                 //printf("Marking inode %d\n", directory_entries[j].inode);
-                if(strncmp(names, ".", directory_entries[j].name_len) && strncmp(names, "..", directory_entries[j].name_len))
+                if(strcmp(names, ".") && strcmp(names, ".."))
                     mark_actual_inode(directory_entries[j].inode);
             }
 
@@ -441,6 +496,7 @@ void mark_subtrees(int inode_num){
     }
 }
 
+//Check if a given block is allocated else mark it as allocated
 void mark_actual_block(int block_num){
     int block_group = (block_num - 1) / super.s_blocks_per_group;
     int block_index = (block_num - 1) % super.s_blocks_per_group;
@@ -448,22 +504,24 @@ void mark_actual_block(int block_num){
     int block_byte_offset = (block_index % 8);
     int mask = 1 << block_byte_offset;
     if((actual_block_bitmap[block_group][block_byte_index] & mask) == 0){
-        printf("Allocated block %d is not marked as allocated. Fixed\n", block_num);
+        if(block_num > 255)
+            printf("Allocated block %d is not marked as allocated. Fixed\n", block_num);
         actual_block_bitmap[block_group][block_byte_index] |= mask; 
     }
 
 }
 
+//Write the block bitmap to disk
 void persist_block_bitmap(){
     int i;
     int block_start;
     for (i = 0; i < number_block_groups; i++){
-        printf("Persisting block group number %d\n", i);
         block_start = read_bytes(group_descriptor_table, 32 * i, 4); 
         write_sectors(partition_start + (block_start * sectors_per_block), sectors_per_block, actual_block_bitmap[i]);
     }
 }
 
+//Function to traverse the directory tree
 void traverse_directories(int inode_num, bool count_links, bool fix_blocks){
     mark_actual_inode(inode_num);   //Kepp track of the reachable inodes
     struct ext2_inode i_info;
@@ -503,8 +561,8 @@ void traverse_directories(int inode_num, bool count_links, bool fix_blocks){
                     names[k] = directory_entries[j].name[k];
                 }
                 names[k] = '\0';
-                if(strncmp(names, ".", directory_entries[j].name_len)
-                        && strncmp(names, "..", directory_entries[j].name_len)){
+                if(strcmp(names, ".")
+                        && strcmp(names, "..")){
                     traverse_directories(directory_entries[j].inode, count_links, fix_blocks);
                 }
             }
@@ -544,6 +602,7 @@ void traverse_directories(int inode_num, bool count_links, bool fix_blocks){
 
 }
 
+//Read directory blocks from a given block number and store number of entries in count
 struct ext2_dir_entry_2* read_directory_block(int block_num, int *count){
     unsigned char buf[sector_size_bytes * sectors_per_block];
     read_sectors(partition_start + (sectors_per_block * block_num), sectors_per_block, buf);
@@ -595,7 +654,7 @@ void read_sectors (int64_t start_sector, unsigned int num_sectors, void *into)
     if ((lret = lseek64(device, sector_offset, SEEK_SET)) != sector_offset) {
         fprintf(stderr, "Seek to position %"PRId64" failed: "
                 "returned %"PRId64"\n", sector_offset, lret);
-        exit(-1);
+        exit(EX_IOERR);
     }
 
     bytes_to_read = sector_size_bytes * num_sectors;
@@ -603,7 +662,7 @@ void read_sectors (int64_t start_sector, unsigned int num_sectors, void *into)
     if ((ret = read(device, into, bytes_to_read)) != bytes_to_read) {
         fprintf(stderr, "Read sector %"PRId64" length %d failed: "
                 "returned %"PRId64"\n", start_sector, num_sectors, ret);
-        exit(-1);
+        exit(EX_IOERR);
     }
 }
 
@@ -619,7 +678,7 @@ void write_sectors (int64_t start_sector, unsigned int num_sectors, void *from)
     if ((lret = lseek64(device, sector_offset, SEEK_SET)) != sector_offset) {
         fprintf(stderr, "Seek to position %"PRId64" failed: "
                 "returned %"PRId64"\n", sector_offset, lret);
-        exit(-1);
+        exit(EX_IOERR);
     }
 
     bytes_to_write = sector_size_bytes * num_sectors;
@@ -627,10 +686,11 @@ void write_sectors (int64_t start_sector, unsigned int num_sectors, void *from)
     if ((ret = write(device, from, bytes_to_write)) != bytes_to_write) {
         fprintf(stderr, "Write sector %"PRId64" length %d failed: "
                 "returned %"PRId64"\n", start_sector, num_sectors, ret);
-        exit(-1);
+        exit(EX_IOERR);
     }
 }
 
+//Store details about partition part_number in struct pointed to by data
 void get_partition_details(int part_number, p_metadata *data){
     if (part_number < 0) {
         data->part_type = -1;
@@ -742,6 +802,7 @@ unsigned char get_partition_type (unsigned char *sector, int part_num) {
     return sector[446 + (part_num) * 16 + 4];
 }
 
+//Read superblock info
 void read_superblock_info(int part_number, struct ext2_super_block *superblock) {
     unsigned char buf[sector_size_bytes];
     p_metadata part_detail;
@@ -759,6 +820,7 @@ void read_superblock_info(int part_number, struct ext2_super_block *superblock) 
     return;
 }
 
+//Read group descriptor info into memory location pointed to by gd_info
 void read_gd_info(int block_group, struct ext2_group_desc *gd_info) {
     int offset = block_group * 32;
     gd_info->bg_block_bitmap = read_bytes(group_descriptor_table, offset+0, 4);
@@ -773,6 +835,7 @@ uint32_t get_inode_sector_offset(uint32_t inode_size, uint32_t inode_index) {
     return inode_index/(sector_size_bytes/inode_size);
 }
 
+//Read inode info into memory location pointed to by i_info
 void read_inode_info(uint32_t inode_num, struct ext2_inode *i_info) {
     int block_group = (inode_num - 1) / super.s_inodes_per_group;
     struct ext2_group_desc gd_info;
@@ -793,6 +856,7 @@ void read_inode_info(uint32_t inode_num, struct ext2_inode *i_info) {
     }    
 }
 
+//Check if inode has been allocated
 bool inode_allocated(uint32_t inode_num, char **bitmap) {
     int block_group = (inode_num - 1) / super.s_inodes_per_group;
     int offset = block_group * 32;
